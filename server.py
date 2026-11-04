@@ -9,11 +9,12 @@ from collections import Counter, defaultdict
 from statistics import median
 from typing import Literal
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from mcp.types import InputRequiredResult
 
 from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
-from sf311.kit import caller_email
+from sf311.kit import ask_choice, caller_email, read_choice
 
 mcp = FastMCP("sf-311")
 log = logging.getLogger("sf311.server")
@@ -147,6 +148,84 @@ def count_by_hour(
     counts = Counter(r.opened.hour for r in _matching(service, neighborhood))
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return {str(hour): count for hour, count in ranked}
+
+
+OFFICIAL_BY_LOWER = {name.lower(): name for name in NEIGHBORHOODS}
+LOCAL_BY_LOWER = {name.lower(): name for name in LOCAL_NAMES}
+OVERLAPS: dict[str, list[str]] = {
+    local: sorted({r.neighborhood for r in REQUESTS if r.local_name == local and r.neighborhood})
+    for local in LOCAL_NAMES
+}
+NEIGHBORHOOD_CHOICE = "neighborhood_part"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def count_in_neighborhood(
+    name: str,
+    ctx: Context,
+    boundary: str | None = None,
+) -> int | str | InputRequiredResult:
+    """Count 311 requests in a neighborhood, by official or local name.
+
+    Use this when the user names a place, including local names such as
+    "Lower Nob Hill" or "Duboce Triangle" that are not one of the 41 official
+    neighborhoods. Returns one number.
+
+    - An official neighborhood name counts that neighborhood.
+    - A local name inside one official neighborhood counts that local area.
+    - A local name that spans several official neighborhoods asks the user
+      which part to count, unless `boundary` is given. Pass boundary="all" to
+      count the whole local area, or one official neighborhood name to count
+      only the part inside it. If the user declines, this returns a message
+      and counts nothing.
+
+    For breakdowns by service, weekday, or source, use count_requests with an
+    official neighborhood name.
+    """
+    key = name.strip().lower()
+    if key in OFFICIAL_BY_LOWER:
+        official = OFFICIAL_BY_LOWER[key]
+        return sum(1 for r in REQUESTS if r.neighborhood == official)
+
+    if key not in LOCAL_BY_LOWER:
+        suggestions = closest(name, NEIGHBORHOODS + LOCAL_NAMES)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise ToolError(
+            f"Unknown neighborhood {name!r}.{hint} "
+            "Call dataset_info for the official neighborhood names."
+        )
+
+    local = LOCAL_BY_LOWER[key]
+    in_area = [r for r in REQUESTS if r.local_name == local]
+    parts = OVERLAPS[local]
+    if len(parts) <= 1:
+        return len(in_area)
+
+    all_option = f"All of {local}"
+    if boundary is None:
+        choice = read_choice(ctx, NEIGHBORHOOD_CHOICE)
+        if choice is None:
+            return ask_choice(
+                NEIGHBORHOOD_CHOICE,
+                f"{local} spans {len(parts)} official neighborhoods. Which part should I count?",
+                parts + [all_option],
+            )
+        if not choice.accepted:
+            return (
+                f"Nothing was counted: the user did not pick a part of {local}. "
+                f"Call again with boundary set to one of {', '.join(parts)}, or 'all'."
+            )
+        boundary = choice.value
+
+    if boundary.strip().lower() in ("all", all_option.lower()):
+        return len(in_area)
+    part = {p.lower(): p for p in parts}.get(boundary.strip().lower())
+    if part is None:
+        raise ToolError(
+            f"{local} does not overlap {boundary!r}. "
+            f"Use boundary='all' or one of: {', '.join(parts)}."
+        )
+    return sum(1 for r in in_area if r.neighborhood == part)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
