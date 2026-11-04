@@ -159,6 +159,60 @@ OVERLAPS: dict[str, list[str]] = {
 NEIGHBORHOOD_CHOICE = "neighborhood_part"
 
 
+def _resolve_place(name: str) -> tuple[Literal["official", "local"], str]:
+    """Match a place name, ignoring case, to an official neighborhood (preferred) or a local name."""
+    key = name.strip().lower()
+    if key in OFFICIAL_BY_LOWER:
+        return "official", OFFICIAL_BY_LOWER[key]
+    if key in LOCAL_BY_LOWER:
+        return "local", LOCAL_BY_LOWER[key]
+    suggestions = closest(name, NEIGHBORHOODS + LOCAL_NAMES)
+    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise ToolError(
+        f"Unknown neighborhood {name!r}.{hint} "
+        "Call dataset_info for the official neighborhood names."
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def neighborhood_breakdown(name: str) -> dict:
+    """Split a place's 311 requests across the official neighborhoods it overlaps.
+
+    Use this for "which official neighborhood has the largest share", "what
+    part of X is in Y", or "how is X split" questions about a local name such
+    as "Lower Nob Hill" or "Alamo Square". Never asks the user anything.
+
+    Returns {"name", "total", "parts"}, where parts is a list of
+    {"neighborhood", "requests", "share_percent"}, largest first. An official
+    neighborhood name returns a single part. Requests with no official
+    neighborhood are listed as "Unknown".
+
+    For a single count, use count_in_neighborhood. For breakdowns by service,
+    weekday, or source, use count_requests with an official neighborhood name.
+    """
+    kind, place = _resolve_place(name)
+    if kind == "official":
+        rows = [r for r in REQUESTS if r.neighborhood == place]
+        counts = Counter({place: len(rows)})
+    else:
+        rows = [r for r in REQUESTS if r.local_name == place]
+        counts = Counter(r.neighborhood or "Unknown" for r in rows)
+    total = len(rows)
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "name": place,
+        "total": total,
+        "parts": [
+            {
+                "neighborhood": neighborhood,
+                "requests": count,
+                "share_percent": round(100 * count / total, 1) if total else 0.0,
+            }
+            for neighborhood, count in ranked[:MAX_ROWS]
+        ],
+    }
+
+
 @mcp.tool(annotations={"readOnlyHint": True})
 def count_in_neighborhood(
     name: str,
@@ -182,20 +236,11 @@ def count_in_neighborhood(
     For breakdowns by service, weekday, or source, use count_requests with an
     official neighborhood name.
     """
-    key = name.strip().lower()
-    if key in OFFICIAL_BY_LOWER:
-        official = OFFICIAL_BY_LOWER[key]
-        return sum(1 for r in REQUESTS if r.neighborhood == official)
+    kind, place = _resolve_place(name)
+    if kind == "official":
+        return sum(1 for r in REQUESTS if r.neighborhood == place)
 
-    if key not in LOCAL_BY_LOWER:
-        suggestions = closest(name, NEIGHBORHOODS + LOCAL_NAMES)
-        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        raise ToolError(
-            f"Unknown neighborhood {name!r}.{hint} "
-            "Call dataset_info for the official neighborhood names."
-        )
-
-    local = LOCAL_BY_LOWER[key]
+    local = place
     in_area = [r for r in REQUESTS if r.local_name == local]
     parts = OVERLAPS[local]
     if len(parts) <= 1:
