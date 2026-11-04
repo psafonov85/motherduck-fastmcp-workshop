@@ -12,6 +12,7 @@ from typing import Literal
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import InputRequiredResult
+from pydantic import BaseModel, Field
 
 from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
 from sf311.kit import ask_choice, caller_email, read_choice
@@ -271,6 +272,120 @@ def count_in_neighborhood(
             f"Use boundary='all' or one of: {', '.join(parts)}."
         )
     return sum(1 for r in in_area if r.neighborhood == part)
+
+
+MAX_SEGMENTS = 50
+INTERSECTION_PREFIX = "INTERSECTION "
+
+
+def _street_key(street: str) -> str:
+    return " ".join(street.upper().split())
+
+
+def _locate(address: str) -> tuple[str, int] | frozenset[str] | None:
+    """Parse an address into (street, block), or the set of streets at an intersection."""
+    match = HOUSE_NUMBER.match(address)
+    if match:
+        return _street_key(match.group(2)), int(match.group(1)) // 100 * 100
+    if address.upper().startswith(INTERSECTION_PREFIX):
+        parts = address[len(INTERSECTION_PREFIX):].split(",")
+        return frozenset(_street_key(p) for p in parts[:2] if p.strip())
+    return None
+
+
+LOCATIONS = {r.request_id: _locate(r.address) for r in REQUESTS}
+STREETS = sorted(
+    {loc[0] for loc in LOCATIONS.values() if isinstance(loc, tuple)}
+    | {s for loc in LOCATIONS.values() if isinstance(loc, frozenset) for s in loc}
+)
+STREET_SET = set(STREETS)
+
+
+class StreetSegment(BaseModel):
+    street: str = Field(description='Street name as the city writes it, e.g. "VALENCIA ST" or "TIFFANY AVE".')
+    from_block: int | None = Field(
+        default=None, description="First block to include, e.g. 1500 for the 1500 block. Omit for the whole street."
+    )
+    to_block: int | None = Field(
+        default=None, description="Last block to include, e.g. 1600. Omit for the whole street."
+    )
+
+
+StreetGroup = Literal["service", "status", "neighborhood", "local_name", "street"]
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def count_on_streets(
+    segments: list[StreetSegment],
+    group_by: StreetGroup = "service",
+    service: str | None = None,
+) -> dict:
+    """Count 311 requests in an area you define by streets and block ranges.
+
+    Use this for places that are neither official neighborhoods nor local
+    names from dataset_info, such as "La Lengua", or for a stretch of one
+    street. Describe the area as street segments, e.g.
+    [{"street": "VALENCIA ST", "from_block": 1500, "to_block": 1600},
+     {"street": "TIFFANY AVE"}]. A request matches when its address is on a
+    listed street within the block range. An intersection matches when both
+    of its streets are listed.
+
+    Returns {"total", "open", "by_<group_by>"}, where the breakdown is a dict
+    of group -> count, largest first, at most 50 groups. Never returns
+    addresses. A block range cannot tell which side of a street a request is
+    on, so boundary streets count both sides.
+
+    service must be an exact name from dataset_info. Use count_in_neighborhood
+    or neighborhood_breakdown for named places.
+    """
+    if not segments:
+        raise ToolError("Give at least one street segment, e.g. [{\"street\": \"VALENCIA ST\"}].")
+    if len(segments) > MAX_SEGMENTS:
+        raise ToolError(f"Give at most {MAX_SEGMENTS} street segments; split the area into smaller parts.")
+    _check_name(service, SERVICES, "service")
+
+    ranges: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for segment in segments:
+        street = _street_key(segment.street)
+        if street not in STREET_SET:
+            suggestions = closest(street, STREETS)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise ToolError(
+                f"No requests this week on a street named {segment.street!r}.{hint} "
+                'Use the city\'s spelling with its suffix, e.g. "VALENCIA ST" or "CESAR CHAVEZ ST".'
+            )
+        low = segment.from_block // 100 * 100 if segment.from_block is not None else 0
+        high = segment.to_block if segment.to_block is not None else 10**9
+        if low > high:
+            raise ToolError(f"from_block {segment.from_block} is after to_block {segment.to_block} on {street}.")
+        ranges[street].append((low, high))
+
+    def inside(request: Request) -> bool:
+        loc = LOCATIONS[request.request_id]
+        if isinstance(loc, tuple):
+            street, block = loc
+            return any(low <= block <= high for low, high in ranges.get(street, ()))
+        if isinstance(loc, frozenset):
+            return len(loc) == 2 and loc <= ranges.keys()
+        return False
+
+    rows = [r for r in REQUESTS if (service is None or r.service == service) and inside(r)]
+
+    def group_key(request: Request) -> str:
+        if group_by == "street":
+            loc = LOCATIONS[request.request_id]
+            return loc[0] if isinstance(loc, tuple) else " & ".join(sorted(loc))
+        if group_by == "local_name":
+            return request.local_name or "Unknown"
+        return GROUPS[group_by](request) or "Unknown"
+
+    counts = Counter(group_key(r) for r in rows)
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "total": len(rows),
+        "open": sum(1 for r in rows if r.status == "Open"),
+        f"by_{group_by}": dict(ranked[:MAX_ROWS]),
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
